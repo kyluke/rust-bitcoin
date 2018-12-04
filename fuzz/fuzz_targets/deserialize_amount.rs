@@ -2,15 +2,28 @@ extern crate bitcoin;
 use std::str::FromStr;
 fn do_test(data: &[u8]) {
     let data_str = String::from_utf8_lossy(data);
-    let dec = match bitcoin::util::decimal::UDecimal::from_str(&data_str) {
-        Ok(dec) => dec,
+
+    // signed
+    let samt = match bitcoin::util::amount::SignedAmount::from_str(&data_str) {
+        Ok(amt) => amt,
         Err(_) => return,
     };
-    let dec_roundtrip = match bitcoin::util::decimal::UDecimal::from_str(&dec.to_string()) {
-        Ok(dec) => dec,
+    let samt_roundtrip = match bitcoin::util::amount::SignedAmount::from_str(&samt.to_string()) {
+        Ok(amt) => amt,
         Err(_) => return,
     };
-    assert_eq!(dec, dec_roundtrip);
+    assert_eq!(samt, samt_roundtrip);
+
+    // unsigned
+    let amt = match bitcoin::util::amount::Amount::from_str(&data_str) {
+        Ok(amt) => amt,
+        Err(_) => return,
+    };
+    let amt_roundtrip = match bitcoin::util::amount::Amount::from_str(&amt.to_string()) {
+        Ok(amt) => amt,
+        Err(_) => return,
+    };
+    assert_eq!(amt, amt_roundtrip);
 }
 
 #[cfg(feature = "afl")]

@@ -19,19 +19,19 @@
 //! also defines (de)serialization routines for many primitives.
 //!
 
-use std::iter;
+use std::{iter, mem};
 use std::io::Cursor;
-use std::sync::mpsc::Sender;
 
 use blockdata::block;
 use blockdata::transaction;
 use network::address::Address;
 use network::message_network;
 use network::message_blockdata;
+use network::message_filter;
 use consensus::encode::{Decodable, Encodable};
-use consensus::encode::CheckedData;
+use consensus::encode::{CheckedData, VarInt};
 use consensus::encode::{self, serialize, Encoder, Decoder};
-use util;
+use consensus::encode::MAX_VEC_SIZE;
 
 /// Serializer for command string
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -62,20 +62,13 @@ impl<D: Decoder> Decodable<D> for CommandString {
     }
 }
 
+#[derive(Debug)]
 /// A Network message
 pub struct RawNetworkMessage {
     /// Magic bytes to identify the network these messages are meant for
     pub magic: u32,
     /// The actual message data
     pub payload: NetworkMessage
-}
-
-/// A response from the peer-connected socket
-pub enum SocketResponse {
-    /// A message was received
-    MessageReceived(NetworkMessage),
-    /// An error occured and the socket needs to close
-    ConnectionFailed(util::Error, Sender<()>)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -105,7 +98,9 @@ pub enum NetworkMessage {
     /// `block`
     Block(block::Block),
     /// `headers`
-    Headers(Vec<block::LoneBlockHeader>),
+    Headers(Vec<block::BlockHeader>),
+    /// `sendheaders`
+    SendHeaders,
     /// `getaddr`
     GetAddr,
     // TODO: checkorder,
@@ -117,7 +112,18 @@ pub enum NetworkMessage {
     Pong(u64),
     // TODO: reject,
     // TODO: bloom filtering
-    // TODO: alert
+    /// BIP157 getcfilters
+    GetCFilters(message_filter::GetCFilters),
+    /// BIP157 cfilter
+    CFilter(message_filter::CFilter),
+    /// BIP157 getcfheaders
+    GetCFHeaders(message_filter::GetCFHeaders),
+    /// BIP157 cfheaders
+    CFHeaders(message_filter::CFHeaders),
+    /// BIP157 getcfcheckpt
+    GetCFCheckpt(message_filter::GetCFCheckpt),
+    /// BIP157 cfcheckpt
+    CFCheckpt(message_filter::CFCheckpt),
     /// `alert`
     Alert(Vec<u8>)
 }
@@ -138,11 +144,31 @@ impl RawNetworkMessage {
             NetworkMessage::Tx(_)      => "tx",
             NetworkMessage::Block(_)   => "block",
             NetworkMessage::Headers(_) => "headers",
+            NetworkMessage::SendHeaders => "sendheaders",
             NetworkMessage::GetAddr    => "getaddr",
             NetworkMessage::Ping(_)    => "ping",
             NetworkMessage::Pong(_)    => "pong",
+            NetworkMessage::GetCFilters(_) => "getcfilters",
+            NetworkMessage::CFilter(_) => "cfilter",
+            NetworkMessage::GetCFHeaders(_) => "getcfheaders",
+            NetworkMessage::CFHeaders(_) => "cfheaders",
+            NetworkMessage::GetCFCheckpt(_) => "getcfckpt",
+            NetworkMessage::CFCheckpt(_) => "cfcheckpt",
             NetworkMessage::Alert(_)    => "alert",
         }.to_owned()
+    }
+}
+
+struct HeaderSerializationWrapper<'a>(&'a Vec<block::BlockHeader>);
+impl <'a, S: Encoder> Encodable<S> for HeaderSerializationWrapper<'a> {
+    #[inline]
+    fn consensus_encode(&self, s: &mut S) -> Result<(), encode::Error> {
+        VarInt(self.0.len() as u64).consensus_encode(s)?;
+        for header in self.0.iter() {
+            header.consensus_encode(s)?;
+            0u8.consensus_encode(s)?;
+        }
+        Ok(())
     }
 }
 
@@ -160,14 +186,43 @@ impl<S: Encoder> Encodable<S> for RawNetworkMessage {
             NetworkMessage::GetHeaders(ref dat) => serialize(dat),
             NetworkMessage::Tx(ref dat)      => serialize(dat),
             NetworkMessage::Block(ref dat)   => serialize(dat),
-            NetworkMessage::Headers(ref dat) => serialize(dat),
+            NetworkMessage::Headers(ref dat) => serialize(&HeaderSerializationWrapper(dat)),
             NetworkMessage::Ping(ref dat)    => serialize(dat),
             NetworkMessage::Pong(ref dat)    => serialize(dat),
+            NetworkMessage::GetCFilters(ref dat) => serialize(dat),
+            NetworkMessage::CFilter(ref dat) => serialize(dat),
+            NetworkMessage::GetCFHeaders(ref dat) => serialize(dat),
+            NetworkMessage::CFHeaders(ref dat) => serialize(dat),
+            NetworkMessage::GetCFCheckpt(ref dat) => serialize(dat),
+            NetworkMessage::CFCheckpt(ref dat) => serialize(dat),
             NetworkMessage::Alert(ref dat)    => serialize(dat),
             NetworkMessage::Verack
+            | NetworkMessage::SendHeaders
             | NetworkMessage::MemPool
             | NetworkMessage::GetAddr => vec![],
         }).consensus_encode(s)
+    }
+}
+
+struct HeaderDeserializationWrapper(Vec<block::BlockHeader>);
+impl<D: Decoder> Decodable<D> for HeaderDeserializationWrapper {
+    #[inline]
+    fn consensus_decode(d: &mut D) -> Result<HeaderDeserializationWrapper, encode::Error> {
+        let len = VarInt::consensus_decode(d)?.0;
+        let byte_size = (len as usize)
+                            .checked_mul(mem::size_of::<block::BlockHeader>())
+                            .ok_or(encode::Error::ParseFailed("Invalid length"))?;
+        if byte_size > MAX_VEC_SIZE {
+            return Err(encode::Error::OversizedVectorAllocation { requested: byte_size, max: MAX_VEC_SIZE })
+        }
+        let mut ret = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            ret.push(Decodable::consensus_decode(d)?);
+            if <u8 as Decodable<D>>::consensus_decode(d)? != 0u8 {
+                return Err(encode::Error::ParseFailed("Headers message should not contain transactions"));
+            }
+        }
+        Ok(HeaderDeserializationWrapper(ret))
     }
 }
 
@@ -189,11 +244,20 @@ impl<D: Decoder> Decodable<D> for RawNetworkMessage {
             "getheaders" => NetworkMessage::GetHeaders(Decodable::consensus_decode(&mut mem_d)?),
             "mempool" => NetworkMessage::MemPool,
             "block"   => NetworkMessage::Block(Decodable::consensus_decode(&mut mem_d)?),
-            "headers" => NetworkMessage::Headers(Decodable::consensus_decode(&mut mem_d)?),
+            "headers" =>
+                NetworkMessage::Headers(<HeaderDeserializationWrapper as Decodable<Cursor<Vec<u8>>>>
+                                        ::consensus_decode(&mut mem_d)?.0),
+            "sendheaders" => NetworkMessage::SendHeaders,
             "getaddr" => NetworkMessage::GetAddr,
             "ping"    => NetworkMessage::Ping(Decodable::consensus_decode(&mut mem_d)?),
             "pong"    => NetworkMessage::Pong(Decodable::consensus_decode(&mut mem_d)?),
             "tx"      => NetworkMessage::Tx(Decodable::consensus_decode(&mut mem_d)?),
+            "getcfilters" => NetworkMessage::GetCFilters(Decodable::consensus_decode(&mut mem_d)?),
+            "cfilter" => NetworkMessage::CFilter(Decodable::consensus_decode(&mut mem_d)?),
+            "getcfheaders" => NetworkMessage::GetCFHeaders(Decodable::consensus_decode(&mut mem_d)?),
+            "cfheaders" => NetworkMessage::CFHeaders(Decodable::consensus_decode(&mut mem_d)?),
+            "getcfckpt" => NetworkMessage::GetCFCheckpt(Decodable::consensus_decode(&mut mem_d)?),
+            "cfcheckpt" => NetworkMessage::CFCheckpt(Decodable::consensus_decode(&mut mem_d)?),
             "alert"   => NetworkMessage::Alert(Decodable::consensus_decode(&mut mem_d)?),
             _ => return Err(encode::Error::UnrecognizedNetworkCommand(cmd)),
         };
@@ -207,8 +271,7 @@ impl<D: Decoder> Decodable<D> for RawNetworkMessage {
 #[cfg(test)]
 mod test {
     use super::{RawNetworkMessage, NetworkMessage, CommandString};
-
-    use consensus::encode::{deserialize, serialize};
+    use consensus::encode::{deserialize, deserialize_partial, serialize};
 
     #[test]
     fn serialize_commandstring_test() {
@@ -260,4 +323,89 @@ mod test {
                                   0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
     }
 
+    #[test]
+    fn deserialize_getaddr_test() {
+        let msg = deserialize(
+            &[0xf9, 0xbe, 0xb4, 0xd9, 0x67, 0x65, 0x74, 0x61,
+                0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
+        let preimage = RawNetworkMessage { magic: 0xd9b4bef9, payload: NetworkMessage::GetAddr };
+        assert!(msg.is_ok());
+        let msg : RawNetworkMessage = msg.unwrap();
+        assert_eq!(preimage.magic, msg.magic);
+        assert_eq!(preimage.payload, msg.payload);
+    }
+
+    #[test]
+    fn deserialize_version_test() {
+        let msg = deserialize::<RawNetworkMessage>(
+            &[  0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73,
+                0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x66, 0x00, 0x00, 0x00, 0xbe, 0x61, 0xb8, 0x27,
+                0x7f, 0x11, 0x01, 0x00, 0x0d, 0x04, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0xf0, 0x0f, 0x4d, 0x5c,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+                0x5b, 0xf0, 0x8c, 0x80, 0xb4, 0xbd, 0x0d, 0x04,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xfa, 0xa9, 0x95, 0x59, 0xcc, 0x68, 0xa1, 0xc1,
+                0x10, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68,
+                0x69, 0x3a, 0x30, 0x2e, 0x31, 0x37, 0x2e, 0x31,
+                0x2f, 0x93, 0x8c, 0x08, 0x00, 0x01 ]);
+
+        assert!(msg.is_ok());
+        let msg = msg.unwrap();
+        assert_eq!(msg.magic, 0xd9b4bef9);
+        if let NetworkMessage::Version(version_msg) = msg.payload {
+            assert_eq!(version_msg.version, 70015);
+            assert_eq!(version_msg.services, 1037);
+            assert_eq!(version_msg.timestamp, 1548554224);
+            assert_eq!(version_msg.nonce, 13952548347456104954);
+            assert_eq!(version_msg.user_agent, "/Satoshi:0.17.1/");
+            assert_eq!(version_msg.start_height, 560275);
+            assert_eq!(version_msg.relay, true);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
+
+    #[test]
+    fn deserialize_partial_message_test() {
+        let data = [  0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73,
+            0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x66, 0x00, 0x00, 0x00, 0xbe, 0x61, 0xb8, 0x27,
+            0x7f, 0x11, 0x01, 0x00, 0x0d, 0x04, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0xf0, 0x0f, 0x4d, 0x5c,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+            0x5b, 0xf0, 0x8c, 0x80, 0xb4, 0xbd, 0x0d, 0x04,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xfa, 0xa9, 0x95, 0x59, 0xcc, 0x68, 0xa1, 0xc1,
+            0x10, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68,
+            0x69, 0x3a, 0x30, 0x2e, 0x31, 0x37, 0x2e, 0x31,
+            0x2f, 0x93, 0x8c, 0x08, 0x00, 0x01, 0, 0 ];
+        let msg = deserialize_partial::<RawNetworkMessage>(&data);
+        assert!(msg.is_ok());
+
+        let (msg, consumed) = msg.unwrap();
+        assert_eq!(consumed, data.to_vec().len() - 2);
+        assert_eq!(msg.magic, 0xd9b4bef9);
+        if let NetworkMessage::Version(version_msg) = msg.payload {
+            assert_eq!(version_msg.version, 70015);
+            assert_eq!(version_msg.services, 1037);
+            assert_eq!(version_msg.timestamp, 1548554224);
+            assert_eq!(version_msg.nonce, 13952548347456104954);
+            assert_eq!(version_msg.user_agent, "/Satoshi:0.17.1/");
+            assert_eq!(version_msg.start_height, 560275);
+            assert_eq!(version_msg.relay, true);
+        } else {
+            panic!("Wrong message type");
+        }
+    }
 }

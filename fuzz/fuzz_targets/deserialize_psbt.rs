@@ -1,16 +1,7 @@
 extern crate bitcoin;
-use std::str::FromStr;
+
 fn do_test(data: &[u8]) {
-    let data_str = String::from_utf8_lossy(data);
-    let dec = match bitcoin::util::decimal::Decimal::from_str(&data_str) {
-        Ok(dec) => dec,
-        Err(_) => return,
-    };
-    let dec_roundtrip = match bitcoin::util::decimal::Decimal::from_str(&dec.to_string()) {
-        Ok(dec) => dec,
-        Err(_) => return,
-    };
-    assert_eq!(dec, dec_roundtrip);
+    let _: Result<bitcoin::util::psbt::PartiallySignedTransaction, _> = bitcoin::consensus::encode::deserialize(data);
 }
 
 #[cfg(feature = "afl")]
@@ -55,7 +46,7 @@ mod tests {
     #[test]
     fn duplicate_crash() {
         let mut a = Vec::new();
-        extend_vec_from_hex("00000000", &mut a);
+        extend_vec_from_hex("00", &mut a);
         super::do_test(&a);
     }
 }

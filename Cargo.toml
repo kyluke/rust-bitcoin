@@ -1,7 +1,6 @@
-
 [package]
 name = "bitcoin"
-version = "0.15.1"
+version = "0.18.0"
 authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
 license = "CC0-1.0"
 homepage = "https://github.com/rust-bitcoin/rust-bitcoin/"
@@ -16,28 +15,30 @@ name = "bitcoin"
 path = "src/lib.rs"
 
 [features]
-fuzztarget = ["secp256k1/fuzztarget"]
-serde-decimal = ["serde", "strason"]
+fuzztarget = ["secp256k1/fuzztarget", "bitcoin_hashes/fuzztarget"]
+unstable = []
+use-serde = ["serde", "bitcoin_hashes/serde"]
 
 [dependencies]
-bitcoin-bech32 = "0.8.0"
+bitcoin-bech32 = "0.9.0"
 byteorder = "1.2"
-rand = "0.3"
-rust-crypto = "0.2"
+bitcoin_hashes = "0.3"
 bitcoinconsensus = { version = "0.16", optional = true }
 
 [dependencies.serde]
 version = "1"
+features = ["derive"]
 optional = true
-
-[dependencies.strason]
-version = "0.4"
-optional = true
-default-features = false
 
 [dependencies.hex]
 version = "=0.3.2"
 
 [dependencies.secp256k1]
-version = "0.11"
+version = "0.12"
 features = [ "rand" ]
+
+[dev-dependencies]
+serde_derive = "1"
+serde_json = "1"
+serde_test = "1"
+tempfile = "3"

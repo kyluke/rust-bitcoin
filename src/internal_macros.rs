@@ -12,6 +12,10 @@
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 //
 
+//! Internal Macros
+//!
+//! Macros meant to be used inside the Rust Bitcoin library
+
 macro_rules! impl_consensus_encoding {
     ($thing:ident, $($field:ident),+) => (
         impl<S: ::consensus::encode::Encoder> ::consensus::encode::Encodable<S> for $thing {
@@ -29,25 +33,6 @@ macro_rules! impl_consensus_encoding {
                 Ok($thing {
                     $( $field: Decodable::consensus_decode(d)?, )+
                 })
-            }
-        }
-    );
-}
-
-macro_rules! impl_newtype_consensus_encoding {
-    ($thing:ident) => (
-        impl<S: ::consensus::encode::Encoder> ::consensus::encode::Encodable<S> for $thing {
-            #[inline]
-            fn consensus_encode(&self, s: &mut S) -> Result<(), ::consensus::encode::Error> {
-                let &$thing(ref data) = self;
-                data.consensus_encode(s)
-            }
-        }
-
-        impl<D: ::consensus::encode::Decoder> ::consensus::encode::Decodable<D> for $thing {
-            #[inline]
-            fn consensus_decode(d: &mut D) -> Result<$thing, ::consensus::encode::Error> {
-                Ok($thing(Decodable::consensus_decode(d)?))
             }
         }
     );
@@ -134,7 +119,7 @@ macro_rules! impl_array_newtype {
                 // manually implement comparison to get little-endian ordering
                 // (we need this for our numeric types; non-numeric ones shouldn't
                 // be ordered anyway except to put them in BTrees or whatever, and
-                // they don't care how we order as long as we're consisistent).
+                // they don't care how we order as long as we're consistent).
                 for i in 0..$len {
                     if self[$len - 1 - i] < other[$len - 1 - i] { return ::std::cmp::Ordering::Less; }
                     if self[$len - 1 - i] > other[$len - 1 - i] { return ::std::cmp::Ordering::Greater; }
@@ -167,13 +152,6 @@ macro_rules! impl_array_newtype {
                 for d in data.iter() {
                     (&d[..]).hash(state);
                 }
-            }
-        }
-
-        impl ::rand::Rand for $thing {
-            #[inline]
-            fn rand<R: ::rand::Rng>(r: &mut R) -> $thing {
-                $thing(::rand::Rand::rand(r))
             }
         }
     }
@@ -295,7 +273,7 @@ macro_rules! display_from_debug {
 macro_rules! hex_script (($s:expr) => (::blockdata::script::Script::from(::hex::decode($s).unwrap())));
 
 #[cfg(test)]
-macro_rules! hex_hash (($s:expr) => (::util::hash::Sha256dHash::from(&::hex::decode($s).unwrap()[..])));
+macro_rules! hex_hash (($s:expr) => (::bitcoin_hashes::sha256d::Hash::from_slice(&::hex::decode($s).unwrap()).unwrap()));
 
 macro_rules! serde_struct_impl {
     ($name:ident, $($fe:ident),*) => (
@@ -415,4 +393,108 @@ macro_rules! serde_struct_impl {
             }
         }
     )
+}
+
+macro_rules! user_enum {
+    (
+        $(#[$attr:meta])*
+        pub enum $name:ident {
+            $(#[$doc:meta]
+              $elem:ident <-> $txt:expr),*
+        }
+    ) => (
+        $(#[$attr])*
+        pub enum $name {
+            $(#[$doc] $elem),*
+        }
+
+        impl ::std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+                f.pad(match *self {
+                    $($name::$elem => $txt),*
+                })
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+                f.pad(match *self {
+                    $($name::$elem => $txt),*
+                })
+            }
+        }
+
+        impl ::std::str::FromStr for $name {
+            type Err = ::std::io::Error;
+            #[inline]
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($txt => Ok($name::$elem)),*,
+                    _ => Err(::std::io::Error::new(
+                        ::std::io::ErrorKind::InvalidInput,
+                        format!("Unknown network (type {})", s),
+                    )),
+                }
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> $crate::serde::Deserialize<'de> for $name {
+            #[inline]
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: $crate::serde::Deserializer<'de>,
+            {
+                use $crate::std::fmt::{self, Formatter};
+
+                struct Visitor;
+                impl<'de> $crate::serde::de::Visitor<'de> for Visitor {
+                    type Value = $name;
+
+                    fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
+                        formatter.write_str("an enum value")
+                    }
+
+                    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                    where
+                        E: $crate::serde::de::Error,
+                    {
+                        static FIELDS: &'static [&'static str] = &[$(stringify!($txt)),*];
+
+                        $( if v == $txt { Ok($name::$elem) } )else*
+                        else {
+                            Err(E::unknown_variant(v, FIELDS))
+                        }
+                    }
+
+                    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+                    where
+                        E: $crate::serde::de::Error,
+                    {
+                        self.visit_str(v)
+                    }
+
+                    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+                    where
+                        E: $crate::serde::de::Error,
+                    {
+                        self.visit_str(&v)
+                    }
+
+                }
+
+                deserializer.deserialize_str(Visitor)
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl ::serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                serializer.serialize_str(&self.to_string())
+            }
+        }
+    );
 }
